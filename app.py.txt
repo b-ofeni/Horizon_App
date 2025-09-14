@@ -1,0 +1,495 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import pickle
+import re
+import holidays
+import networkx as nx
+import nltk
+import torch
+import matplotlib.pyplot as plt # Import matplotlib for plotting
+
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+import category_encoders as ce
+from sklearn.decomposition import PCA
+from transformers import AutoTokenizer, AutoModel
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+# Ensure NLTK resources are available (download if not present)
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    nltk.download('vader_lexicon')
+
+
+# Load the saved preprocessing components and the trained model
+
+# Use st.cache_resource to cache the loading of heavy components
+@st.cache_resource
+def load_components():
+    try:
+        # Load the trained XGBoost model
+        with open('best_xgboost_model.pkl', 'rb') as f:
+            best_xgboost_model = pickle.load(f)
+
+        # Load the preprocessing pipeline
+        with open('fitted_preprocessor.pkl', 'rb') as f:
+            preprocessing_pipeline = pickle.load(f)
+
+        # Load other necessary components
+        with open('preprocessor_input_column_names.pkl', 'rb') as f:
+            preprocessor_input_column_names = pickle.load(f)
+
+        with open('location_centrality_df.pkl', 'rb') as f:
+            location_centrality_df = pickle.load(f)
+
+        with open('customer_centrality_df.pkl', 'rb') as f:
+            customer_centrality_df = pickle.load(f)
+
+        with open('xtrain_columns.pkl', 'rb') as f:
+            xtrain_columns = pickle.load(f)
+
+        with open('percentile_90_claim_amount.pkl', 'rb') as f:
+            percentile_90 = pickle.load(f)
+
+        with open('claim_counts_2years.pkl', 'rb') as f:
+            claim_counts_2years = pickle.load(f)
+
+        with open('customer_claim_counts.pkl', 'rb') as f:
+            customer_claim_counts = pickle.load(f)
+
+        with open('fraudulent_customers.pkl', 'rb') as f:
+            fraudulent_customers = pickle.load(f)
+
+        with open('fitted_pca_transformer.pkl', 'rb') as f:
+            fitted_pca_transformer = pickle.load(f)
+
+        with open('fitted_tfidf_vectorizer.pkl', 'rb') as f:
+            fitted_tfidf_vectorizer = pickle.load(f)
+
+        # Load the Hugging Face tokenizer and model for embeddings
+        tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+        model = AutoModel.from_pretrained('distilbert-base-uncased')
+
+        return (best_xgboost_model, preprocessing_pipeline, preprocessor_input_column_names,
+                location_centrality_df, customer_centrality_df, xtrain_columns, percentile_90,
+                claim_counts_2years, customer_claim_counts, fraudulent_customers,
+                fitted_pca_transformer, fitted_tfidf_vectorizer, tokenizer, model)
+
+    except FileNotFoundError as e:
+        st.error(f"Error loading a required file: {e}. Please ensure all .pkl files are in the same directory as app.py")
+        st.stop() # Stop the app execution
+    except Exception as e:
+        st.error(f"An unexpected error occurred during component loading: {e}")
+        st.stop() # Stop the app execution
+
+# Load components
+(best_xgboost_model, preprocessing_pipeline, preprocessor_input_column_names,
+ location_centrality_df, customer_centrality_df, xtrain_columns, percentile_90,
+ claim_counts_2years, customer_claim_counts, fraudulent_customers,
+ fitted_pca_transformer, fitted_tfidf_vectorizer, tokenizer, model) = load_components()
+
+
+# Define the feature engineering function to apply the same steps as in the notebook
+def engineer_features(df, claim_counts_2years, customer_claim_counts, fraudulent_customers, percentile_90, location_centrality_df, customer_centrality_df, fitted_tfidf_vectorizer, fitted_pca_transformer):
+    try:
+        # Ensure date columns are datetime objects with robust error handling
+        date_cols = ['Incident_Date', 'Claim_Submission_Date', 'Policy_Start_Date', 'Policy_End_Date']
+        for col in date_cols:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
+            else:
+                # Add missing date columns with NaT if they are not in the input data
+                df[col] = pd.NaT
+
+
+        # Handle potential missing values in categorical and numerical columns *before* passing to the pipeline
+        # This is an extra layer of robustness, although the pipeline also has imputers.
+        categorical_cols = [col for col in df.columns if df[col].dtype == 'object' and col not in ['Claim_ID', 'Policy_Number', 'Customer_Name', 'Customer_Email', 'Customer_Phone', 'Adjuster_Notes', 'Claim_Status']] # Exclude identifier/text cols
+        numerical_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col]) and col not in ['Claim_ID', 'Policy_Number', 'Customer_Name', 'Customer_Email', 'Customer_Phone', 'Adjuster_Notes', 'Claim_Status', 'Fraud_Flag']] # Exclude identifier/text/target cols
+
+        for col in categorical_cols:
+            df[col] = df[col].fillna('missing')
+
+        for col in numerical_cols:
+            df[col] = df[col].fillna(df[col].mean() if not df[col].isnull().all() else 0.0) # Fill with mean or 0 if all are NaN
+
+
+        # Re-create engineered features from the notebook
+        # Handle potential NaT values in date columns when calculating features
+        start_year = df['Incident_Date'].min().year if not df['Incident_Date'].min() is pd.NaT else 2023 # Use a default if no valid dates
+        end_year = df['Incident_Date'].max().year if not df['Incident_Date'].max() is pd.NaT else 2025 # Use a default if no valid dates
+        years = range(start_year, end_year + 1)
+        nigerian_holidays = holidays.Nigeria(years=years)
+        df['Incident_on_Holiday'] = df['Incident_Date'].apply(lambda date: date in nigerian_holidays if not pd.isna(date) else 0).astype(int)
+
+        df['Incident_on_Weekend'] = df['Incident_Date'].dt.dayofweek.apply(lambda x: 1 if x >= 5 else 0) if not df['Incident_Date'].isnull().all() else 0
+        df['Claim_Submission_on_Weekend'] = df['Claim_Submission_Date'].dt.dayofweek.apply(lambda x: 1 if x >= 5 else 0) if not df['Claim_Submission_Date'].isnull().all() else 0
+
+        # Calculate days to submission, handling potential NaT values by resulting in NaN
+        df['Days_to_Claim_Submission'] = (df['Claim_Submission_Date'] - df['Incident_Date']).dt.days
+        df['Late_Claim_Submission'] = (df['Days_to_Claim_Submission'] >= 90).astype(int)
+
+        # Calculate policy duration, handling potential NaT values by resulting in NaN
+        df['Policy_Duration_Days'] = (df['Policy_End_Date'] - df['Policy_Start_Date']).dt.days
+
+        # Re-merge claim counts within 2 years (assuming claim_counts_2years is loaded)
+        # Ensure 'Policy_Number' exists before merging
+        if 'Policy_Number' in df.columns:
+            df = df.merge(claim_counts_2years, on='Policy_Number', how='left')
+        else:
+            df['Claim_Count_2Years'] = 0 # Add column with default 0 if Policy_Number is missing
+
+        df['Claim_Count_2Years'] = df['Claim_Count_2Years'].fillna(0)
+        df['Frequent_Claimant'] = (df['Claim_Count_2Years'] > 3).astype(int)
+
+        # Use the loaded 90th percentile for High Claim amount Flag
+        # Ensure 'Claim_Amount' exists and is numeric
+        if 'Claim_Amount' in df.columns and pd.api.types.is_numeric_dtype(df['Claim_Amount']):
+             df['High_Claim_Amount_Flag'] = (df['Claim_Amount'] > percentile_90).astype(int)
+        else:
+            df['High_Claim_Amount_Flag'] = 0 # Default to 0 if missing or not numeric
+
+
+        # Calculate Claim vs Premium Ratio, handling potential division by zero and missing values
+        # Ensure 'Claim_Amount' and 'Premium_Amount' exist and are numeric
+        if 'Claim_Amount' in df.columns and 'Premium_Amount' in df.columns and pd.api.types.is_numeric_dtype(df['Claim_Amount']) and pd.api.types.is_numeric_dtype(df['Premium_Amount']):
+            df['Claim_vs_Premium_Ratio'] = df['Claim_Amount'] / df['Premium_Amount'].replace(0, np.nan) # Replace 0 premium with NaN to avoid inf
+            df['Claim_vs_Premium_Ratio'] = df['Claim_vs_Premium_Ratio'].replace([np.inf, -np.inf], np.nan).fillna(0) # Replace inf with NaN and fill NaN with 0
+        else:
+            df['Claim_vs_Premium_Ratio'] = 0.0 # Default to 0 if missing or not numeric
+
+
+        # Re-merge customer claim counts (assuming customer_claim_counts is loaded)
+        # Ensure 'Customer_Name' exists before merging
+        if 'Customer_Name' in df.columns:
+            df = df.merge(customer_claim_counts, on='Customer_Name', how='left')
+            df['Customer_Claim_Count'] = df['Customer_Claim_Count'].fillna(0) # Handle new customers
+        else:
+            df['Customer_Claim_Count'] = 0 # Add column with default 0 if Customer_Name is missing
+
+        df['Frequent_Customer_Claimant'] = (df['Customer_Claim_Count'] > 2).astype(int)
+
+        # Use the loaded set of fraudulent customers for Prior Fraudulent Claim
+        # Ensure 'Customer_Name' exists
+        if 'Customer_Name' in df.columns:
+            df['Prior_Fraudulent_Claim'] = df['Customer_Name'].apply(lambda x: 1 if x in fraudulent_customers else 0)
+        else:
+            df['Prior_Fraudulent_Claim'] = 0 # Default to 0 if Customer_Name is missing
+
+
+        # Add features for claims within 2 months of policy start/end dates, handling potential NaT values
+        df['Claim_Within_2Months_of_Start'] = ((df['Claim_Submission_Date'] - df['Policy_Start_Date']).dt.days <= 60
+        ).astype(int)
+
+        df['Claim_Within_2Months_of_End'] = ( ((df['Policy_End_Date'] - df['Claim_Submission_Date']).dt.days <= 60) &
+            ((df['Policy_End_Date'] - df['Claim_Submission_Date']).dt.days >= 0)
+        ).astype(int)
+
+
+        # Apply TF-IDF transformation using the fitted vectorizer
+        # Ensure 'Adjuster_Notes' exists and handle potential errors during transformation
+        tfidf_df = pd.DataFrame() # Initialize empty DataFrame
+        if 'Adjuster_Notes' in df.columns:
+            try:
+                df['Adjuster_Notes'] = df['Adjuster_Notes'].fillna('') # Handle potential missing values
+                tfidf_matrix = fitted_tfidf_vectorizer.transform(df['Adjuster_Notes'])
+                tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=[f"tfidf_{word}" for word in fitted_tfidf_vectorizer.get_feature_names_out()])
+            except Exception as e:
+                st.error(f"Error during TF-IDF transformation: {e}")
+                # If TF-IDF fails, create dummy columns with zeros
+                for word in fitted_tfidf_vectorizer.get_feature_names_out():
+                    tfidf_df[f"tfidf_{word}"] = 0.0
+        else:
+            # Add dummy TF-IDF columns with zeros if 'Adjuster_Notes' is missing
+            for word in fitted_tfidf_vectorizer.get_feature_names_out():
+                tfidf_df[f"tfidf_{word}"] = 0.0
+
+        # Concatenate TF-IDF features, ensuring original df index is reset
+        df = pd.concat([df.reset_index(drop=True), tfidf_df.reset_index(drop=True)], axis=1)
+
+
+        # Use the loaded overall centrality from training data
+        # Ensure 'Customer_Name' and 'Location' exist before merging
+        if 'Customer_Name' in df.columns:
+            df = df.merge(customer_centrality_df, on='Customer_Name', how='left')
+            df['Customer_Centrality'] = df['Customer_Centrality'].fillna(0) # Fill NaN for new customers not in training data
+        else:
+             df['Customer_Centrality'] = 0.0 # Add column with default 0 if Customer_Name is missing
+
+        if 'Location' in df.columns:
+            df = df.merge(location_centrality_df, on='Location', how='left')
+            df['Location_Centrality'] = df['Location_Centrality'].fillna(0) # Fill NaN for new locations not in training data
+        else:
+            df['Location_Centrality'] = 0.0 # Add column with default 0 if Location is missing
+
+
+        # Sentiment Analysis (Using VADER)
+        sia = SentimentIntensityAnalyzer()
+        # Ensure 'Adjuster_Notes' exists
+        if 'Adjuster_Notes' in df.columns:
+            df['Sentiment_Score'] = df['Adjuster_Notes'].apply(lambda x: sia.polarity_scores(str(x))['compound'])
+        else:
+            df['Sentiment_Score'] = 0.0 # Default to 0 if Adjuster_Notes is missing
+
+        df['Negative_Tone_Flag'] = df['Sentiment_Score'] < -0.5 # This will work even if Sentiment_Score was defaulted to 0
+
+
+        # Apply PCA transformation using the fitted transformer
+        # Ensure 'Adjuster_Notes' exists and handle potential errors in embedding creation
+        embedding_pca_df = pd.DataFrame() # Initialize empty DataFrame
+        if 'Adjuster_Notes' in df.columns:
+            def get_embedding(text):
+                text = str(text)
+                inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
+
+            try:
+                df['adjuster_embedding'] = df['Adjuster_Notes'].apply(get_embedding)
+                embedding_matrix = np.vstack(df['adjuster_embedding'].values)
+                reduced_embeddings = fitted_pca_transformer.transform(embedding_matrix) # Use fitted transformer
+                embedding_pca_df = pd.DataFrame(reduced_embeddings, columns=[f'embed_pca_{i+1}' for i in range(fitted_pca_transformer.n_components)]) # Use n_components from fitted transformer
+                df = pd.concat([df.drop(columns=['adjuster_embedding']).reset_index(drop=True), embedding_pca_df.reset_index(drop=True)], axis=1)
+            except Exception as e:
+                st.error(f"Error during embedding creation or PCA transformation: {e}")
+                # If embedding/PCA fails, create placeholder columns with zeros
+                for i in range(fitted_pca_transformer.n_components):
+                    embedding_pca_df[f'embed_pca_{i+1}'] = 0.0
+                # Concatenate even if embedding failed to ensure structure is similar
+                df = pd.concat([df.reset_index(drop=True), embedding_pca_df.reset_index(drop=True)], axis=1)
+
+        else:
+            # Create placeholder PCA columns with zeros if 'Adjuster_Notes' is missing
+            for i in range(fitted_pca_transformer.n_components):
+                embedding_pca_df[f'embed_pca_{i+1}'] = 0.0
+            df = pd.concat([df.reset_index(drop=True), embedding_pca_df.reset_index(drop=True)], axis=1)
+
+
+        # Standardize the Sentiment Score (using a new scaler or the one from training if saved)
+        # Ensure 'Sentiment_Score' exists and handle potential NaNs before scaling
+        if 'Sentiment_Score' in df.columns:
+            scaler = StandardScaler()
+            # Handle potential NaNs in Sentiment_Score before scaling
+            df['Sentiment_Score_Scaled'] = scaler.fit_transform(df[['Sentiment_Score']].fillna(df['Sentiment_Score'].mean() if not df['Sentiment_Score'].isnull().all() else 0.0))
+        else:
+             df['Sentiment_Score_Scaled'] = 0.0 # Add column with default 0 if Sentiment_Score is missing
+
+
+        return df
+    except Exception as e:
+        # Catch any unhandled errors during feature engineering and return None
+        st.error(f"An error occurred during feature engineering: {e}")
+        return None
+
+
+# Define the prediction function
+def predict_fraud(data):
+    # Check if input data is None or empty after feature engineering
+    if data is None or data.empty:
+        return None, None, "Input data is empty or feature engineering failed."
+
+    # Apply the full preprocessing pipeline
+    # Ensure input data has all columns from preprocessor_input_column_names,
+    # add missing ones with default values before transforming
+    for col in preprocessor_input_column_names:
+        if col not in data.columns:
+            # Determine a suitable default value based on expected dtype or content
+            if col in ['Claim_Amount', 'Premium_Amount', 'Customer_Age']:
+                 data[col] = 0.0 # Default numeric to 0.0
+            elif 'Date' in col:
+                 data[col] = pd.NaT # Default date to NaT
+            elif col in ['Claim_Count_2Years', 'Frequent_Claimant', 'High_Claim_Amount_Flag', 'Customer_Claim_Count', 'Frequent_Customer_Claimant', 'Prior_Fraudulent_Claim', 'Claim_Within_2Months_of_Start', 'Claim_Within_2Months_of_End', 'Incident_on_Holiday', 'Incident_on_Weekend', 'Claim_Submission_on_Weekend', 'Days_to_Claim_Submission', 'Late_Claim_Submission', 'Policy_Duration_Days']:
+                 data[col] = 0 # Default integer/binary flags to 0
+            elif col in ['Adjuster_Notes', 'Customer_Name', 'Location', 'Policy_Number', 'Claim_ID', 'Customer_Email', 'Customer_Phone', 'Claim_Status', 'Policy_Type', 'Claim_Type', 'Incident_Type', 'Customer_Gender', 'Customer_Occupation']:
+                 data[col] = 'missing' # Default object/string to 'missing'
+            else:
+                 data[col] = 0 # Default any other missing column to 0
+
+
+    # Ensure the order of columns is the same as expected by the preprocessor
+    data = data[preprocessor_input_column_names]
+
+    try:
+        processed_data = preprocessing_pipeline.transform(data)
+
+        # Convert processed data back to DataFrame with correct columns
+        processed_df = pd.DataFrame(processed_data, columns=xtrain_columns)
+
+        # Ensure all columns from training data are present in the processed data,
+        # add missing columns with 0 if necessary (can happen with one-hot encoding)
+        missing_cols = set(xtrain_columns) - set(processed_df.columns)
+        for c in missing_cols:
+            processed_df[c] = 0
+
+        # Ensure the order of columns is the same as in the training data
+        processed_df = processed_df[xtrain_columns]
+
+
+        # Make predictions using the loaded model
+        prediction = best_xgboost_model.predict(processed_df)
+        prediction_proba = best_xgboost_model.predict_proba(processed_df)[:, 1]
+
+        return prediction, prediction_proba, None # Return None for error
+    except Exception as e:
+        return None, None, f"Error during preprocessing or prediction: {e}" # Return error message
+
+
+# Create the Streamlit application interface
+st.title("Insurance Claim Fraud Detection")
+
+st.write("""
+This application predicts the likelihood of an insurance claim being fraudulent
+based on various claim and customer details.
+""")
+
+# Add a radio button to select input method
+input_method = st.radio("Select Input Method:", ("Single Claim Prediction", "Bulk Claim Prediction (CSV Upload)"))
+
+
+if input_method == "Single Claim Prediction":
+    st.header("Enter Claim Details:")
+
+    # Example input fields (adjust based on your actual features)
+    claim_id = st.text_input("Claim ID", "e3e70682-c209-4cac-a29f-6fbed82c07cd")
+    policy_number = st.text_input("Policy Number", "POL6048764")
+    customer_name = st.text_input("Customer Name", "Heather Snow")
+    customer_email = st.text_input("Customer Email", "juancampos@lloyd.org")
+    customer_phone = st.text_input("Customer Phone", "(411)578-1565")
+    location = st.selectbox("Location", ['Ibadan', 'Port Harcourt', 'Abuja', 'Kano', 'Lagos'])
+    policy_type = st.selectbox("Policy Type", ['Family', 'Corporate', 'Individual'])
+    claim_type = st.selectbox("Claim Type", ['Health', 'Life', 'Auto', 'Fire', 'Gadget'])
+    incident_type = st.selectbox("Incident Type", ['Fire', 'Death', 'Accident', 'Illness', 'Theft'])
+    incident_date = st.date_input("Incident Date", pd.to_datetime('2024-10-30'))
+    claim_submission_date = st.date_input("Claim Submission Date", pd.to_datetime('2024-11-05'))
+    claim_amount = st.number_input("Claim Amount", 0.0, step=100.0, value=483077.79)
+    claim_status = st.selectbox("Claim Status", ['Approved', 'Denied', 'Pending', 'Closed'])
+    adjuster_notes = st.text_area("Adjuster Notes", "Local tend employee source nature add rest humans. Offer face country cost party prevent live bedroom. International artist situation talk despite statement.")
+    customer_gender = st.selectbox("Customer Gender", ['Female', 'Male'])
+    customer_age = st.number_input("Customer Age", 0, step=1, value=28)
+    customer_occupation = st.selectbox("Customer_Occupation", ['Artisan', 'Unemployed', 'Student', 'Teacher', 'Engineer', 'Trader', 'Driver'])
+    policy_start_date = st.date_input("Policy Start Date", pd.to_datetime('2022-11-12'))
+    policy_end_date = st.date_input("Policy End Date", pd.to_datetime('2025-07-13'))
+    premium_amount = st.number_input("Premium Amount", 0.0, step=100.0, value=82785.56)
+
+    # Create a dictionary from the input values
+    input_data = {
+        'Claim_ID': [claim_id],
+        'Policy_Number': [policy_number],
+        'Customer_Name': [customer_name],
+        'Customer_Email': [customer_email],
+        'Customer_Phone': [customer_phone],
+        'Location': [location],
+        'Policy_Type': [policy_type],
+        'Claim_Type': [claim_type],
+        'Incident_Type': [incident_type],
+        'Incident_Date': [incident_date],
+        'Claim_Submission_Date': [claim_submission_date],
+        'Claim_Amount': [claim_amount],
+        'Claim_Status': [claim_status],
+        'Adjuster_Notes': [adjuster_notes],
+        'Customer_Gender': [customer_gender],
+        'Customer_Age': [customer_age],
+        'Customer_Occupation': [customer_occupation],
+        'Policy_Start_Date': [policy_start_date],
+        'Policy_End_Date': [policy_end_date],
+        'Premium_Amount': [premium_amount]
+    }
+
+    # Convert the input data to a pandas DataFrame
+    input_df = pd.DataFrame(input_data)
+
+    # Prediction button
+    if st.button("Predict Fraud"):
+        # Feature engineer the input data
+        engineered_input_df = engineer_features(
+            input_df.copy(), # Use a copy to avoid modifying the original input_df
+            claim_counts_2years,
+            customer_claim_counts,
+            fraudulent_customers,
+            percentile_90,
+            location_centrality_df,
+            customer_centrality_df,
+            fitted_tfidf_vectorizer,
+            fitted_pca_transformer
+            )
+
+
+        # Make prediction
+        prediction, prediction_proba, error = predict_fraud(engineered_input_df)
+
+        # Display prediction result
+        st.header("Prediction Result:")
+        if error:
+            st.error(f"Prediction Error: {error}")
+        elif prediction[0] == 1:
+            st.error(f"Fraudulent Claim Predicted (Probability: {prediction_proba[0]:.4f})")
+        else:
+            st.success(f"Not Fraudulent Claim Predicted (Probability: {prediction_proba[0]:.4f})")
+
+elif input_method == "Bulk Claim Prediction (CSV Upload)":
+    st.header("Upload CSV for Bulk Prediction:")
+    uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+
+    if uploaded_file is not None:
+        try:
+            bulk_input_df = pd.read_csv(uploaded_file)
+
+            # Add a button to trigger bulk prediction
+            if st.button("Predict Fraud (Bulk)"):
+                # Feature engineer the bulk input data
+                engineered_bulk_df = engineer_features(
+                    bulk_input_df.copy(), # Use a copy
+                    claim_counts_2years,
+                    customer_claim_counts,
+                    fraudulent_customers,
+                    percentile_90,
+                    location_centrality_df,
+                    customer_centrality_df,
+                    fitted_tfidf_vectorizer,
+                    fitted_pca_transformer
+                )
+
+                # Make predictions
+                bulk_predictions, bulk_probabilities, error = predict_fraud(engineered_bulk_df)
+
+                # Display the predictions or error
+                st.subheader("Bulk Prediction Results:")
+                if error:
+                     st.error(f"Prediction Error: {error}")
+                else:
+                    # Add predictions and probabilities to the original bulk DataFrame
+                    bulk_input_df['Predicted_Fraud_Flag'] = bulk_predictions
+                    bulk_input_df['Prediction_Probability'] = bulk_probabilities
+
+                    st.write(bulk_input_df[['Claim_ID', 'Predicted_Fraud_Flag', 'Prediction_Probability']])
+
+                    # Generate and display prediction summary and pie chart
+                    fraud_counts = bulk_input_df['Predicted_Fraud_Flag'].value_counts()
+                    total_claims = fraud_counts.sum()
+                    num_fraudulent = fraud_counts.get(1, 0) # Get count for fraud (1), default to 0 if none
+                    num_legitimate = fraud_counts.get(0, 0) # Get count for legitimate (0), default to 0 if none
+
+                    st.subheader("Prediction Summary:")
+                    st.write(f"Total Claims Processed: {total_claims}")
+                    st.write(f"Number of Fraudulent Claims Predicted: {num_fraudulent}")
+                    st.write(f"Number of Legitimate Claims Predicted: {num_legitimate}")
+
+                    # Create pie chart
+                    if total_claims > 0:
+                        labels = ['Fraudulent', 'Legitimate']
+                        sizes = [num_fraudulent, num_legitimate]
+                        colors = ['red', 'green']
+                        fig1, ax1 = plt.subplots()
+                        ax1.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+                        ax1.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+                        st.subheader("Prediction Distribution:")
+                        st.pyplot(fig1)
+
+
+        except Exception as e:
+            st.error(f"Error processing the uploaded file: {e}")
